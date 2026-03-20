@@ -190,6 +190,15 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 
 /* DATE col */
 .date-col{font-family:var(--mono);font-size:10px;color:var(--text3);white-space:nowrap}
+
+/* LINK GAME */
+.link-ev{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border:1px solid var(--border2);border-radius:2px;cursor:pointer;transition:all .12s;gap:10px}
+.link-ev:hover{border-color:var(--blue);background:var(--blue-bg)}
+.link-ev.linked{border-color:var(--green);background:var(--green-bg)}
+.link-ev-name{font-family:var(--mono);font-size:11px;color:var(--text);line-height:1.5}
+.link-ev-meta{font-size:10px;color:var(--text3);margin-top:2px;font-family:var(--mono)}
+.link-ev-status{font-family:var(--mono);font-size:9px;white-space:nowrap;padding:2px 7px;border-radius:2px}
+.link-pin-icon{font-size:11px;color:var(--green);font-family:var(--mono);flex-shrink:0}
 </style>
 </head>
 <body>
@@ -368,6 +377,24 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
   </div>
 </div>
 
+<!-- LINK GAME MODAL -->
+<div class="overlay" id="linkModal">
+  <div class="modal" style="max-width:520px">
+    <div class="modal-hdr">
+      <span class="modal-title">Link Game to ESPN Event</span>
+      <button class="close-btn" onclick="closeModal('linkModal')">×</button>
+    </div>
+    <div class="modal-body" style="padding-bottom:8px">
+      <div class="res-info" id="linkBetInfo" style="margin-bottom:14px">—</div>
+      <div id="linkGameList" style="display:flex;flex-direction:column;gap:6px;max-height:360px;overflow-y:auto"></div>
+    </div>
+    <div class="modal-ftr" style="justify-content:space-between">
+      <button class="act del" onclick="unlinkGame()" style="padding:6px 14px;font-size:10px">Unlink / Auto-detect</button>
+      <button class="cancel-btn" onclick="closeModal('linkModal')">Cancel</button>
+    </div>
+  </div>
+</div>
+
 <!-- NOTES MODAL -->
 <div class="overlay" id="notesModal">
   <div class="modal" style="max-width:460px">
@@ -512,36 +539,73 @@ function renderScoresSidebar() {
   pane.innerHTML = html;
 }
 
+function teamMatchScore(team, tokens) {
+  // Returns a score 0-3 for how well a team matches a set of tokens.
+  // Requires a meaningful hit — abbreviation must be a standalone word token, not a substring.
+  const display = (team.displayName || '').toLowerCase();
+  const abbr    = (team.abbreviation || '').toLowerCase();
+  const short   = (team.shortDisplayName || '').toLowerCase();
+  const loc     = (team.location || '').toLowerCase();
+  const nick    = (team.name || '').toLowerCase(); // e.g. "Wildcats"
+
+  let best = 0;
+  for (const t of tokens) {
+    if (t.length < 3) continue; // skip tiny tokens — too many false positives
+    // Full display name contains token (e.g. "kentucky" in "kentucky wildcats")
+    if (display.includes(t)) { best = Math.max(best, 3); continue; }
+    // Short name exact or contained (e.g. "kentucky")
+    if (short && (short.includes(t) || t.includes(short))) { best = Math.max(best, 3); continue; }
+    // Location match (e.g. "kentucky")
+    if (loc && loc.includes(t)) { best = Math.max(best, 2); continue; }
+    // Nickname match (e.g. "wildcats", "cats")
+    if (nick && (nick.includes(t) || (t.length >= 4 && nick.includes(t)))) { best = Math.max(best, 2); continue; }
+    // Abbreviation — only as a whole word token, never as substring
+    if (abbr && t === abbr) { best = Math.max(best, 2); continue; }
+  }
+  return best;
+}
+
 function findMatchingEvent(bet) {
-  const query = (bet.game + ' ' + bet.description).toLowerCase();
-  const tokens = query.split(/\s+/).filter(t => t.length > 2);
-  
-  const sportKey = bet.sport;
-  const searchIn = sportKey && scores[sportKey] ? { [sportKey]: scores[sportKey] } : scores;
-  
-  for (const [key, events] of Object.entries(searchIn)) {
-    for (const ev of events) {
-      const comps = ev.competitions?.[0]?.competitors || [];
-      const evName = (ev.name || ev.shortName || '').toLowerCase();
-      let score = 0;
-      
-      // Check team names
-      comps.forEach(c => {
-        const tname = (c.team?.displayName || '').toLowerCase();
-        const tabbr = (c.team?.abbreviation || '').toLowerCase();
-        const tshort = (c.team?.shortDisplayName || '').toLowerCase();
-        tokens.forEach(t => {
-          if (tname.includes(t) || t.includes(tabbr) || tshort.includes(t) || t.includes(tshort)) score += 2;
-        });
-      });
-      
-      // Check event name
-      tokens.forEach(t => { if (evName.includes(t)) score += 1; });
-      
-      if (score >= 2) return ev;
+  // If user manually pinned an ESPN event, use that directly.
+  if (bet.espnEventId) {
+    for (const events of Object.values(scores)) {
+      const ev = events.find(e => e.id === bet.espnEventId);
+      if (ev) return ev;
     }
   }
-  return null;
+
+  // Tokenize only the game field — the description has player/line noise
+  const query = (bet.game || '').toLowerCase();
+  const tokens = query.split(/[\s\-\/,]+/).map(t => t.replace(/[^a-z0-9]/g, '')).filter(t => t.length >= 3);
+  if (!tokens.length) return null;
+
+  const sportKey = bet.sport;
+  const searchIn = sportKey && scores[sportKey] ? { [sportKey]: scores[sportKey] } : scores;
+
+  let bestEv = null, bestScore = 0;
+
+  for (const events of Object.values(searchIn)) {
+    for (const ev of events) {
+      const comps = ev.competitions?.[0]?.competitors || [];
+      if (comps.length < 2) continue;
+
+      // Score EACH competitor independently
+      const compScores = comps.map(c => teamMatchScore(c.team || {}, tokens));
+
+      // REQUIRE: at least 2 distinct competitors get a non-zero score,
+      // and the top-2 combined score must be >= 4 (both teams need meaningful hits)
+      const sorted = [...compScores].sort((a,b) => b - a);
+      const top2Sum = (sorted[0] || 0) + (sorted[1] || 0);
+      const matchingTeams = compScores.filter(s => s > 0).length;
+
+      if (matchingTeams >= 2 && top2Sum >= 4 && top2Sum > bestScore) {
+        bestScore = top2Sum;
+        bestEv = ev;
+      }
+    }
+  }
+
+  return bestEv;
 }
 
 function getLiveScore(bet) {
@@ -734,6 +798,7 @@ function renderBets() {
         <div class="act-wrap">
           <button class="act res" onclick="openResultModal('${bet.id}')">Result</button>
           <button class="act" onclick="openEditModal('${bet.id}')">Edit</button>
+          <button class="act" onclick="openLinkModal('${bet.id}')" style="${bet.espnEventId ? 'border-color:rgba(0,204,122,.4);color:var(--green)' : ''}">🔗 Link</button>
           ${bet.notes ? `<button class="act" onclick="openNotesModal('${bet.id}')">Notes</button>` : ''}
           <button class="act del" onclick="deleteBet('${bet.id}')">×</button>
         </div>
@@ -977,6 +1042,88 @@ function seedSampleBets() {
   ];
   bets = samples;
   saveBets();
+}
+
+// ──────────────────── LINK GAME ────────────────────
+let linkBetId = null;
+
+function openLinkModal(id) {
+  linkBetId = id;
+  const bet = bets.find(b => b.id === id);
+  if (!bet) return;
+
+  document.getElementById('linkBetInfo').innerHTML =
+    `<strong>${esc(bet.game)}</strong><br><span style="font-size:10px">${esc(bet.description)}</span>` +
+    (bet.espnEventId ? `<br><span style="color:var(--green);font-size:10px">Currently pinned to ESPN ID: ${bet.espnEventId}</span>` : '');
+
+  // Build list of all ESPN events for the bet's sport (or all sports if unknown)
+  const sportKey = bet.sport;
+  const allEvents = [];
+  const searchIn = sportKey && scores[sportKey] ? { [sportKey]: scores[sportKey] } : scores;
+
+  for (const [skey, events] of Object.entries(searchIn)) {
+    events.forEach(ev => {
+      const comps = ev.competitions?.[0]?.competitors || [];
+      const away = comps.find(c => c.homeAway === 'away');
+      const home = comps.find(c => c.homeAway === 'home');
+      if (!away || !home) return;
+      const st = getGameStatus(ev);
+      allEvents.push({ ev, skey, away, home, st });
+    });
+  }
+
+  // Sort: live first, then by date
+  allEvents.sort((a, b) => {
+    const liveA = a.st.cls === 'live' ? 0 : a.st.cls === 'pre' ? 1 : 2;
+    const liveB = b.st.cls === 'live' ? 0 : b.st.cls === 'pre' ? 1 : 2;
+    return liveA - liveB;
+  });
+
+  const listEl = document.getElementById('linkGameList');
+  if (!allEvents.length) {
+    listEl.innerHTML = '<div style="font-family:var(--mono);font-size:11px;color:var(--text3);padding:10px">No ESPN games loaded yet. Hit Refresh in the sidebar first.</div>';
+  } else {
+    listEl.innerHTML = allEvents.map(({ ev, skey, away, home, st }) => {
+      const isPinned = bet.espnEventId === ev.id;
+      const awayScore = away.score || '';
+      const homeScore = home.score || '';
+      const scoreStr = (st.cls === 'live' || st.cls === 'final') ? ` · ${away.team?.abbreviation} ${awayScore} - ${home.team?.abbreviation} ${homeScore}` : '';
+      return `<div class="link-ev${isPinned ? ' linked' : ''}" onclick="linkGame('${ev.id}')">
+        <div>
+          <div class="link-ev-name">${esc(away.team?.displayName || '?')} vs ${esc(home.team?.displayName || '?')}</div>
+          <div class="link-ev-meta">${SPORTS[skey]?.label || skey}${scoreStr}</div>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <span class="link-ev-status gstatus ${st.cls}">${st.label}</span>
+          ${isPinned ? '<span class="link-pin-icon">✓ LINKED</span>' : ''}
+        </div>
+      </div>`;
+    }).join('');
+  }
+
+  openModal('linkModal');
+}
+
+function linkGame(espnEventId) {
+  const bet = bets.find(b => b.id === linkBetId);
+  if (!bet) return;
+  bet.espnEventId = espnEventId;
+  saveBets();
+  closeModal('linkModal');
+  renderBets();
+  renderScoresSidebar();
+  showToast('Game linked ✓', 'green');
+}
+
+function unlinkGame() {
+  const bet = bets.find(b => b.id === linkBetId);
+  if (!bet) return;
+  delete bet.espnEventId;
+  saveBets();
+  closeModal('linkModal');
+  renderBets();
+  renderScoresSidebar();
+  showToast('Unlinked — back to auto-detect', 'blue');
 }
 
 // ──────────────────── INIT ────────────────────
